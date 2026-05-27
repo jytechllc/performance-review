@@ -1,151 +1,127 @@
-# Engineering Metrics POC
+# Performance Review Metrics
 
-## Overview
+This repo collects GitHub activity and turns it into simple Markdown reports for performance reviews.
 
-This project is a POC for automated engineering performance metrics collection using the GitHub API.
+You can run it on your computer, or you can let GitHub Actions run it on a schedule.
 
-The system runs through scheduled GitHub Actions workflows and generates simple engineering activity reports for configured engineers.
+## What is in this repo
 
----
+- `scripts/collect_metrics.py` is the main Python script.
+- `config/engineers.yaml` is where you list the engineers and repos to track.
+- `reports/` is where finished reports are saved.
+- `.github/workflows/collect_metrics.yml` is the GitHub Actions workflow.
+- `requirements.txt` lists the Python packages.
 
-## Goals
+## Folder structure
 
-The purpose of this project is to:
+Here is the simple layout:
 
-- Collect GitHub engineering activity metrics
-- Aggregate metrics across multiple time windows
-- Generate automated reports
-- Run entirely through GitHub Actions + Python
+- `.github/workflows/` holds the scheduled GitHub Actions job.
+- `config/` holds the engineer list and repo list.
+- `reports/` holds the output files.
+- `scripts/` holds the Python code.
+- `README.md` explains how to use the repo.
+- `requirements.txt` lists the packages you need.
 
----
+## Report name and location
 
-## Metrics
+Every report is saved under `reports/`.
 
-The MVP currently focuses on collecting:
+The file name uses this pattern:
 
-- Commits
-- Pull Requests
-- Files Changed
-- Lines Added
-- Lines Deleted
-- Repository Contribution Activity
+`reports/<window>/<YYYY-MM>/<username>_<start>_to_<end>.md`
 
-Metrics can be aggregated by:
+Example:
 
-- Daily
-- Weekly
-- Monthly
-- Quarterly
+`reports/weekly/2026-05/octocat_2026-05-11_to_2026-05-17.md`
 
----
+What each part means:
 
-## Tech Stack
+- `<window>` is the time range. Use `daily`, `weekly`, or `monthly`.
+- `<YYYY-MM>` is the month folder for the report end date.
+- `<username>` is the GitHub username made safe for file names.
+- `<start>` and `<end>` are the dates covered by the report.
 
-- Python
-- GitHub API
-- GitHub Actions
-- Markdown/CSV reporting
+## GitHub token
 
----
+The script needs a GitHub token so it can call the GitHub API.
 
-## Folder Structure
+It checks these environment variables in this order:
 
-```text
-performance-review/
-│
-├── .github/
-│   └── workflows/
-│       └── collect_metrics.yml
-│
-├── config/
-│   └── engineers.yaml
-│
-├── reports/
-│
-├── scripts/
-│   ├── fetch_metrics.py
-│   ├── aggregate_metrics.py
-│   └── generate_report.py
-│
-├── requirements.txt
-├── README.md
-└── .env.example
+1. `PERFORMANCE_REVIEW_GITHUB_TOKEN`
+2. `GITHUB_TOKEN`
+
+For GitHub Actions, store the token as a repository secret named `PERFORMANCE_REVIEW_GITHUB_TOKEN`.
+
+For local use, set the same environment variable in your shell.
+
+Do not put a real token into the repo.
+
+## How to add engineers
+
+Add engineers in `config/engineers.yaml`.
+
+Example:
+
+```yaml
+repositories:
+  - octo-org/platform
+  - octo-org/api
+
+engineers:
+  - username: octocat
+    display_name: Octo Cat
+  - username: hubot
+    display_name: Hubot
 ```
 
----
+How it works:
 
-## Setup
+- Put the GitHub usernames under `engineers`.
+- Use `display_name` if you want a nicer name in the report.
+- Add `repositories` under one engineer if you want to track only certain repos for that person.
+- If an engineer does not have a repo list, the script uses the top-level `repositories` list.
 
-### 1. Clone Repository
+## How to run it locally
 
-```bash
-git clone <repo-url>
-cd performance-review
-```
-
-### 2. Install Dependencies
+Install the packages:
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
+Run the collector:
 
-## GitHub Token Configuration
-
-Create a GitHub Personal Access Token with repository read permissions.
-
-Store the token
-
----
-
-## Engineer Configuration
-
-Engineers are configured in:
-
-```text
-config/engineers.yaml
+```bash
+python scripts/collect_metrics.py --window weekly
 ```
 
-Example:
+Useful options:
 
-```yaml
-engineers:
-  - username: 
+- `--window daily|weekly|monthly`
+- `--config config/engineers.yaml`
+- `--output-dir reports`
+- `--as-of YYYY-MM-DD` to use a specific date
 
-  - username: 
-```
+## GitHub Actions
 
----
+The workflow in `.github/workflows/collect_metrics.yml` can run by hand or on a schedule.
 
-## Reports
+When it runs, it:
 
-Generated reports are stored in:
+- checks out the repo
+- installs the Python packages
+- runs the collector script
+- writes new or updated report files back into the repo
 
-```text
-reports/YYYY-MM/
-```
+## What the collector measures
 
-Example:
+The first version collects:
 
-```text
-reports/2026-05/octocat.md
-```
+- commit count
+- merged pull request count
+- additions from merged pull requests
+- deletions from merged pull requests
+- files changed in merged pull requests
 
----
-
-## Example Report Output
-
-```markdown
-# Weekly Engineering Metrics
-
-## octocat
-
-- Commits: 28
-- Pull Requests: 5
-- Files Changed: 364
-- Lines Added: 33262
-- Lines Deleted: 354
-```
-
----
+That gives you a simple starting point, and you can add more metrics later if you want.
