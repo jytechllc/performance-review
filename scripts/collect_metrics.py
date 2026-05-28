@@ -69,9 +69,13 @@ def load_config(config_path):
 
 # This takes a date string from the user and converts it into a date object of real time to work with.
 def parse_reference_date(raw_value):
-    
-    today = dt.datetime.now(dt.timezone.utc).date()
-    return today
+    if not raw_value:
+        return dt.datetime.now(dt.timezone.utc).date()
+
+    try:
+        return dt.date.fromisoformat(raw_value)
+    except ValueError as error:
+        raise SystemExit("Invalid --as-of value. Use YYYY-MM-DD.") from error
 
 
 # This calculates the start and end dates for the report based on the specified time window (daily, weekly, monthly) and the reference date.
@@ -340,6 +344,67 @@ def render_report(report):
     report_lines.append("")
     return "\n".join(report_lines)
 
+
+def render_summary_readme(window, start_date, end_date, engineer_reports, summary_dir):
+    overall_totals = new_repo_stats()
+    engineer_rows = []
+
+    for item in sorted(engineer_reports, key=lambda record: record["report"]["engineer"]["username"]):
+        report = item["report"]
+        report_path = item["path"]
+        totals = sum_repo_stats(report["repo_stats"])
+
+        overall_totals["commits"] += totals["commits"]
+        overall_totals["merged_prs"] += totals["merged_prs"]
+        overall_totals["additions"] += totals["additions"]
+        overall_totals["deletions"] += totals["deletions"]
+        overall_totals["files_changed"] += totals["files_changed"]
+
+        display_name = report["engineer"]["display_name"] or report["engineer"]["username"]
+        relative_report_link = Path(os.path.relpath(report_path, start=summary_dir)).as_posix()
+        engineer_rows.append(
+            "| "
+            f"{display_name} | "
+            f"{report['engineer']['username']} | "
+            f"{totals['commits']} | "
+            f"{totals['merged_prs']} | "
+            f"{totals['additions']} | "
+            f"{totals['deletions']} | "
+            f"{totals['files_changed']} | "
+            f"[Report]({relative_report_link}) |"
+        )
+
+    lines = [
+        f"# Team Summary ({window.title()})",
+        "",
+        f"- Window: `{window}`",
+        f"- Period: `{start_date.isoformat()} to {end_date.isoformat()}`",
+        f"- Engineers: `{len(engineer_reports)}`",
+        "",
+        "## Team Totals",
+        "",
+        "| Metric | Total |",
+        "| --- | ---: |",
+        f"| Commits | {overall_totals['commits']} |",
+        f"| Merged PRs | {overall_totals['merged_prs']} |",
+        f"| PR additions | {overall_totals['additions']} |",
+        f"| PR deletions | {overall_totals['deletions']} |",
+        f"| PR files changed | {overall_totals['files_changed']} |",
+        "",
+        "## Engineer Breakdown",
+        "",
+        "| Engineer | Username | Commits | Merged PRs | Additions | Deletions | Files Changed | Report |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+
+    if engineer_rows:
+        lines.extend(engineer_rows)
+    else:
+        lines.append("| None | - | 0 | 0 | 0 | 0 | 0 | - |")
+
+    lines.append("")
+    return "\n".join(lines)
+
 def write_report(output_dir, report):
     month_folder = report["end_date"].strftime("%Y-%m")
     start_label = report["start_date"].isoformat()
@@ -351,6 +416,21 @@ def write_report(output_dir, report):
     return report_path
 
 
+def write_summary_readme(output_dir, window, start_date, end_date_exclusive, engineer_reports):
+    end_date = end_date_exclusive - dt.timedelta(days=1)
+    month_folder = end_date.strftime("%Y-%m")
+    start_label = start_date.isoformat()
+    end_label = end_date.isoformat()
+    summary_dir = output_dir / "summary" / window / month_folder
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / f"README_{start_label}_to_{end_label}.md"
+    summary_path.write_text(
+        render_summary_readme(window, start_date, end_date, engineer_reports, summary_dir),
+        encoding="utf-8",
+    )
+    return summary_path
+
+
 def main():
     args = parse_args() # Parse command-line arguments provided by the user
     reference_date = parse_reference_date(args.as_of)  # Convert the --as-of argument into a usable date object
@@ -359,10 +439,15 @@ def main():
     session = github_session(token)  # Create and return an authenticated GitHub session
 
     start_date, end_date = resolve_window(args.window, reference_date)
+    engineer_reports = []
 
     for engineer in engineers:
         report = collect_engineer_report(session, engineer, repositories, args.window, start_date, end_date)
-        print(write_report(args.output_dir, report))
+        report_path = write_report(args.output_dir, report)
+        engineer_reports.append({"report": report, "path": report_path})
+        print(report_path)
+
+    print(write_summary_readme(args.output_dir, args.window, start_date, end_date, engineer_reports))
 
 
 if __name__ == "__main__":

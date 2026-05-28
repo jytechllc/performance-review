@@ -27,7 +27,7 @@ Here is the simple layout:
 
 Every report is saved under `reports/`.
 
-The file name uses this pattern:
+Engineer report files use this pattern:
 
 `reports/<window>/<YYYY-MM>/<username>_<start>_to_<end>.md`
 
@@ -41,6 +41,12 @@ What each part means:
 - `<YYYY-MM>` is the month folder for the report end date.
 - `<username>` is the GitHub username made safe for file names.
 - `<start>` and `<end>` are the dates covered by the report.
+
+In addition to individual files, the collector also writes one team-level summary README per run:
+
+`reports/summary/<window>/<YYYY-MM>/README_<start>_to_<end>.md`
+
+This gives you one file with everyone's totals and links to each person's report.
 
 ## GitHub token
 
@@ -102,6 +108,14 @@ Useful options:
 - `--config config/engineers.yaml`
 - `--output-dir reports`
 - `--as-of YYYY-MM-DD` to use a specific date
+
+Examples for each summary cadence:
+
+```bash
+python scripts/collect_metrics.py --window daily
+python scripts/collect_metrics.py --window weekly
+python scripts/collect_metrics.py --window monthly
+```
 
 ## GitHub Actions
 
