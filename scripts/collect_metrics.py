@@ -12,6 +12,10 @@ DEFAULT_CONFIG_PATH = Path("config/engineers.yaml")
 DEFAULT_OUTPUT_DIR = Path("reports")
 
 
+class GitHubApiError(RuntimeError):
+    pass
+
+
 # This reads command-line arguments from the user and allows them to customize
 # how the program runs (like what kind of report to generate, where to save the output).
 def parse_args():
@@ -22,16 +26,51 @@ def parse_args():
     parser.add_argument("--as-of", type=str, help="Reference date in YYYY-MM-DD format")
     return parser.parse_args()
 
-# Loads the GitHub token to authenticate with the GitHub API and collect the required metrics.
-def load_token():
+# Loads the fallback GitHub token used when no per-engineer token is provided.
+def load_fallback_token():
     token = os.getenv("PERFORMANCE_REVIEW_GITHUB_TOKEN")
     if not token:
         token = os.getenv("GITHUB_TOKEN")
-
-    if not token:
-        raise SystemExit("Missing GitHub token. Set PERFORMANCE_REVIEW_GITHUB_TOKEN or GITHUB_TOKEN.")
-
     return token
+
+
+def normalize_repo_name(raw_value):
+    if raw_value is None:
+        return ""
+
+    repo_name = str(raw_value).strip()
+    if not repo_name:
+        return ""
+
+    lowered = repo_name.lower()
+    if lowered in {"none", "null", "~"}:
+        return ""
+
+    # Keep only canonical owner/repo values.
+    if "/" not in repo_name:
+        return ""
+
+    owner, repo = repo_name.split("/", 1)
+    owner = owner.strip()
+    repo = repo.strip()
+    if not owner or not repo:
+        return ""
+
+    return f"{owner}/{repo}"
+
+
+def normalize_text(raw_value):
+    if raw_value is None:
+        return ""
+
+    value = str(raw_value).strip()
+    if not value:
+        return ""
+
+    if value.lower() in {"none", "null", "~"}:
+        return ""
+
+    return value
 
 # If config is available, this loads the config file and checks that it has the right format. It also makes sure that there are engineers and repositories defined and are properly configured.
 
@@ -41,27 +80,33 @@ def load_config(config_path):
 
     repositories = []
     for repo in data.get("repositories", []):
-        repo_name = str(repo).strip()
+        repo_name = normalize_repo_name(repo)
         if repo_name:
             repositories.append(repo_name)
 
     engineers = []
     for item in data.get("engineers", []):
-        username = str(item.get("username", "")).strip()
+        if not isinstance(item, dict):
+            continue
+
+        username = normalize_text(item.get("username", ""))
+        if not username:
+            continue
 
         engineer_repositories = []
         for repo in item.get("repositories", []):
-            repo_name = str(repo).strip()
+            repo_name = normalize_repo_name(repo)
             if repo_name:
                 engineer_repositories.append(repo_name)
 
-        display_name = str(item.get("display_name", "")).strip()
+        display_name = normalize_text(item.get("display_name", ""))
 
         engineers.append(
             {
                 "username": username,
                 "display_name": display_name,
                 "repositories": engineer_repositories,
+                "token_env": normalize_text(item.get("token_env", "")),
             }
         )
 
@@ -116,10 +161,10 @@ def request_json(session, method, path, params=None):
     url = f"{API_BASE_URL}{path}"
     response = session.request(method, url, params=params, timeout=30)
     if response.status_code >= 400:
-        raise SystemExit(f"GitHub API request failed for {path}: {response.status_code} {response.text}")
+        raise GitHubApiError(f"GitHub API request failed for {path}: {response.status_code} {response.text}")
     return response.json()
 
-# This handles paginated API responses from GitHub, automatically fetching all pages of results and combining them into a single list.
+
 def paginate_list(session, path, params=None):
     page = 1
     items = []
@@ -146,16 +191,10 @@ def paginate_list(session, path, params=None):
 
     return items
 
-# This searches for pull requests that were merged in the specified repository and time period, filtering by the author's username. It handles pagination of search results and returns a list of matching pull requests.
-def search_merged_pull_requests(session, repo, username, start_date, end_date):
-    end_inclusive = end_date - dt.timedelta(days=1)
-    # Do not filter by author in the search query, because GitHub returns 422
-    # when the username is invalid or not visible. We filter in Python instead.
-    date_range = f"{start_date.isoformat()}..{end_inclusive.isoformat()}"
-    query = f"repo:{repo} is:pr is:merged merged:{date_range}"
+
+def search_items(session, query):
     page = 1
     results = []
-    wanted_username = username.lower()
 
     while True:
         payload = request_json(
@@ -170,11 +209,7 @@ def search_merged_pull_requests(session, repo, username, start_date, end_date):
         )
 
         page_items = payload.get("items", [])
-
-        for item in page_items:
-            author = str(item.get("user", {}).get("login", ""))
-            if author.lower() == wanted_username:
-                results.append(item)
+        results.extend(page_items)
 
         if len(page_items) < 100:
             break
@@ -182,35 +217,22 @@ def search_merged_pull_requests(session, repo, username, start_date, end_date):
 
     return results
 
+# This searches for pull requests that were merged in the specified repository and time period, filtering by the author's username. It handles pagination of search results and returns a list of matching pull requests.
+def search_merged_pull_requests(session, repo, username, start_date, end_date):
+    end_inclusive = end_date - dt.timedelta(days=1)
+    date_range = f"{start_date.isoformat()}..{end_inclusive.isoformat()}"
+    query = f"repo:{repo} is:pr is:merged merged:{date_range}"
+    results = []
+    wanted_username = username.lower()
 
-def new_repo_stats():
-    return {
-        "commits": 0,
-        "merged_prs": 0,
-        "additions": 0,
-        "deletions": 0,
-        "files_changed": 0,
-    }
+    for item in search_items(session, query):
+        author = str(item.get("user", {}).get("login", ""))
+        if author.lower() == wanted_username:
+            results.append(item)
 
-
-def sum_repo_stats(repo_stats):
-    totals = new_repo_stats()
-
-    for stats in repo_stats.values():
-        totals["commits"] += stats["commits"]
-        totals["merged_prs"] += stats["merged_prs"]
-        totals["additions"] += stats["additions"]
-        totals["deletions"] += stats["deletions"]
-        totals["files_changed"] += stats["files_changed"]
-
-    return totals
+    return results
 
 
-def format_week_label(day):
-    iso_calendar = day.isocalendar()
-    return f"{iso_calendar.year}-W{iso_calendar.week:02d}"
-
-# This counts the number of commits made by the specified user in the given repository and time period by querying the GitHub API.
 def count_commits(session, repo, username, start_date, end_date):
     commits = paginate_list(
         session,
@@ -223,200 +245,185 @@ def count_commits(session, repo, username, start_date, end_date):
     )
     return len(commits)
 
-# This collects the performance metrics for a given engineer and compiles them into a summary report format.
-def collect_engineer_report(session, engineer, repositories, window, start_date, end_date):
+
+def count_closed_issues(session, repo, username, start_date, end_date):
+    closed_issues = paginate_list(
+        session,
+        f"/repos/{repo}/issues",
+        {
+            "state": "closed",
+            "per_page": 100,
+        },
+    )
+
+    count = 0
+    for item in closed_issues:
+        if item.get("pull_request"):
+            continue
+
+        author = str(item.get("user", {}).get("login", ""))
+        if author.lower() != username.lower():
+            continue
+
+        closed_at = item.get("closed_at")
+        if not closed_at:
+            continue
+
+        closed_date = dt.date.fromisoformat(closed_at[:10])
+        if start_date <= closed_date < end_date:
+            count += 1
+
+    return count
+
+
+def new_pr_stats():
+    return {
+        "commits": 0,
+        "merged_prs": 0,
+        "closed_issues": 0,
+        "additions": 0,
+        "deletions": 0,
+        "files_changed": 0,
+    }
+
+
+def resolve_engineer_token(engineer, fallback_token):
+    token_env_name = engineer.get("token_env", "")
+    if token_env_name:
+        # Prefer per-engineer token, but gracefully fall back to shared token.
+        return os.getenv(token_env_name) or fallback_token
+    return fallback_token
+
+
+def validate_engineer_connection(session, engineer, repositories):
+    request_json(session, "GET", "/user")
+    for repo in repositories:
+        request_json(session, "GET", f"/repos/{repo}")
+
+
+# This collects automatic activity metrics for a given engineer across the configured repositories.
+def collect_engineer_activity_metrics(session, engineer, repositories, start_date, end_date):
     repo_scope = engineer["repositories"] or repositories
-    repo_stats = {}
-    pull_requests = []
+    totals = new_pr_stats()
+
+    actual_name = get_github_display_name(session, engineer["username"])
 
     for repo in repo_scope:
-        if repo not in repo_stats:
-            repo_stats[repo] = new_repo_stats()
+        totals["commits"] += count_commits(
+            session, repo, engineer["username"], start_date, end_date
+        )
 
-        commits = count_commits(session, repo, engineer["username"], start_date, end_date)
-        repo_stats[repo]["commits"] += commits
+        totals["closed_issues"] += count_closed_issues(
+            session, repo, engineer["username"], start_date, end_date
+        )
 
-        merged_pull_requests = search_merged_pull_requests(session, repo, engineer["username"], start_date, end_date)
-        repo_stats[repo]["merged_prs"] += len(merged_pull_requests)
+        merged_pull_requests = search_merged_pull_requests(
+            session, repo, engineer["username"], start_date, end_date
+        )
+        totals["merged_prs"] += len(merged_pull_requests)
 
         for pull_request in merged_pull_requests:
             number = int(pull_request["number"])
             details = request_json(session, "GET", f"/repos/{repo}/pulls/{number}")
-            additions = int(details.get("additions", 0))
-            deletions = int(details.get("deletions", 0))
-            files_changed = int(details.get("changed_files", 0))
 
-            repo_stats[repo]["additions"] += additions
-            repo_stats[repo]["deletions"] += deletions
-            repo_stats[repo]["files_changed"] += files_changed
-            pull_requests.append(
-                {
-                    "repo": repo,
-                    "number": number,
-                    "title": str(details.get("title", pull_request.get("title", ""))),
-                    "url": str(details.get("html_url", pull_request.get("html_url", ""))),
-                    "merged_at": str(details.get("merged_at", pull_request.get("closed_at", ""))),
-                    "additions": additions,
-                    "deletions": deletions,
-                    "files_changed": files_changed,
-                }
-            )
+            totals["additions"] += int(details.get("additions", 0))
+            totals["deletions"] += int(details.get("deletions", 0))
+            totals["files_changed"] += int(details.get("changed_files", 0))
 
-    pull_requests.sort(key=lambda record: record["merged_at"], reverse=True)
     return {
-        "engineer": engineer,
-        "window": window,
-        "start_date": start_date,
-        "end_date": end_date - dt.timedelta(days=1),
-        "repo_stats": repo_stats,
-        "pull_requests": pull_requests,
+        "username": engineer["username"],
+        "display_name": engineer["display_name"] or actual_name,
+        "connection": "connected",
+        "tracked_repos": len(repo_scope),
+        "commits": totals["commits"],
+        "merged_prs": totals["merged_prs"],
+        "closed_issues": totals["closed_issues"],
+        "additions": totals["additions"],
+        "deletions": totals["deletions"],
+        "files_changed": totals["files_changed"],
     }
 
-def render_report(report):
-    display_name = report["engineer"]["display_name"]
-    totals = sum_repo_stats(report["repo_stats"])
-    repo_rows = []
 
-    for repo_name, stats in sorted(report["repo_stats"].items()):
-        repo_rows.append(
-            f"| {repo_name} | {stats['commits']} | {stats['merged_prs']} | {stats['additions']} | {stats['deletions']} | {stats['files_changed']} |"
-        )
-
-    pr_rows = []
-    for pull_request in report["pull_requests"]:
-        merged_at = ""
-        if pull_request["merged_at"]:
-            merged_at = pull_request["merged_at"][:10]
-
-        escaped_title = pull_request["title"].replace("|", "\\|")
-        pr_rows.append(
-            f"| {pull_request['repo']} | #{pull_request['number']} | {escaped_title} | {pull_request['additions']} | {pull_request['deletions']} | {pull_request['files_changed']} | {merged_at} |"
-        )
-
-    repositories_text = "None"
-    if report["repo_stats"]:
-        repositories_text = ", ".join(report["repo_stats"])
-
-    report_lines = [
-        f"# {display_name} Performance Review Metrics",
-        "",
-        f"- Username: `{report['engineer']['username']}`",
-        f"- Window: `{report['window']}`",
-        f"- Period: `{report['start_date'].isoformat()} to {report['end_date'].isoformat()}`",
-        f"- Repositories: {repositories_text}",
-        "",
-        "## Summary",
-        "",
-        "| Metric | Total |",
-        "| --- | ---: |",
-        f"| Commits | {totals['commits']} |",
-        f"| Merged PRs | {totals['merged_prs']} |",
-        f"| PR additions | {totals['additions']} |",
-        f"| PR deletions | {totals['deletions']} |",
-        f"| PR files changed | {totals['files_changed']} |",
-        "",
-        "## Repo Breakdown",
-        "",
-        "| Repository | Commits | Merged PRs | Additions | Deletions | Files Changed |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
-    ]
-
-    if repo_rows:
-        report_lines.extend(repo_rows)
-    else:
-        report_lines.append("| None | 0 | 0 | 0 | 0 | 0 |")
-
-    report_lines.extend(
-        [
-            "",
-            "## Merged Pull Requests",
-            "",
-            "| Repository | PR | Title | Additions | Deletions | Files Changed | Merged At |",
-            "| --- | ---: | --- | ---: | ---: | ---: | --- |",
-        ]
-    )
-
-    if pr_rows:
-        report_lines.extend(pr_rows)
-    else:
-        report_lines.append("| None | - | No merged pull requests in this period | 0 | 0 | 0 | - |")
-
-    report_lines.append("")
-    return "\n".join(report_lines)
+def build_disconnected_metrics(engineer, repositories, reason):
+    repo_scope = engineer["repositories"] or repositories
+    return {
+        "username": engineer["username"],
+        "display_name": engineer["display_name"] or engineer["username"],
+        "connection": reason,
+        "tracked_repos": len(repo_scope),
+        "commits": 0,
+        "merged_prs": 0,
+        "closed_issues": 0,
+        "additions": 0,
+        "deletions": 0,
+        "files_changed": 0,
+    }
 
 
-def render_summary_readme(window, start_date, end_date, engineer_reports, summary_dir):
-    overall_totals = new_repo_stats()
-    engineer_rows = []
+def render_mvp_table(engineer_metrics):
+    totals = new_pr_stats()
+    rows = []
 
-    for item in sorted(engineer_reports, key=lambda record: record["report"]["engineer"]["username"]):
-        report = item["report"]
-        report_path = item["path"]
-        totals = sum_repo_stats(report["repo_stats"])
-
-        overall_totals["commits"] += totals["commits"]
-        overall_totals["merged_prs"] += totals["merged_prs"]
-        overall_totals["additions"] += totals["additions"]
-        overall_totals["deletions"] += totals["deletions"]
-        overall_totals["files_changed"] += totals["files_changed"]
-
-        display_name = report["engineer"]["display_name"] or report["engineer"]["username"]
-        relative_report_link = Path(os.path.relpath(report_path, start=summary_dir)).as_posix()
-        engineer_rows.append(
+    for item in sorted(engineer_metrics, key=lambda record: record["username"]):
+        totals["commits"] += item["commits"]
+        totals["merged_prs"] += item["merged_prs"]
+        totals["closed_issues"] += item["closed_issues"]
+        totals["additions"] += item["additions"]
+        totals["deletions"] += item["deletions"]
+        totals["files_changed"] += item["files_changed"]
+        rows.append(
             "| "
-            f"{display_name} | "
-            f"{report['engineer']['username']} | "
-            f"{totals['commits']} | "
-            f"{totals['merged_prs']} | "
-            f"{totals['additions']} | "
-            f"{totals['deletions']} | "
-            f"{totals['files_changed']} | "
-            f"[Report]({relative_report_link}) |"
+            f"{item['display_name']} | "
+            f"{item['username']} | "
+            f"{item['connection']} | "
+            f"{item['tracked_repos']} | "
+            f"{item['commits']} | "
+            f"{item['merged_prs']} | "
+            f"{item['closed_issues']} | "
+            f"{item['additions']} | "
+            f"{item['deletions']} | "
+            f"{item['files_changed']} |"
         )
 
     lines = [
-        f"# Team Summary ({window.title()})",
+        "| Engineer | Username | Connection | Repos | Commits | Merged PRs | Closed Issues | Additions | Deletions | Files Changed |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+
+    if rows:
+        lines.extend(rows)
+    else:
+        lines.append("| None | - | - | 0 | 0 | 0 | 0 | 0 | 0 | 0 |")
+
+    lines.append(
+        "| **Team Total** | - | - | - | "
+        f"**{totals['commits']}** | "
+        f"**{totals['merged_prs']}** | "
+        f"**{totals['closed_issues']}** | "
+        f"**{totals['additions']}** | "
+        f"**{totals['deletions']}** | "
+        f"**{totals['files_changed']}** |"
+    )
+    return "\n".join(lines)
+
+
+def render_summary_markdown(window, start_date, end_date_exclusive, engineer_metrics):
+    end_date = end_date_exclusive - dt.timedelta(days=1)
+    lines = [
+        f"# Activity Metrics Summary ({window.title()})",
         "",
         f"- Window: `{window}`",
         f"- Period: `{start_date.isoformat()} to {end_date.isoformat()}`",
-        f"- Engineers: `{len(engineer_reports)}`",
+        f"- Engineers: `{len(engineer_metrics)}`",
+        "- Connection mode: `PAT (env token)`",
         "",
-        "## Team Totals",
+        render_mvp_table(engineer_metrics),
         "",
-        "| Metric | Total |",
-        "| --- | ---: |",
-        f"| Commits | {overall_totals['commits']} |",
-        f"| Merged PRs | {overall_totals['merged_prs']} |",
-        f"| PR additions | {overall_totals['additions']} |",
-        f"| PR deletions | {overall_totals['deletions']} |",
-        f"| PR files changed | {overall_totals['files_changed']} |",
-        "",
-        "## Engineer Breakdown",
-        "",
-        "| Engineer | Username | Commits | Merged PRs | Additions | Deletions | Files Changed | Report |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
-
-    if engineer_rows:
-        lines.extend(engineer_rows)
-    else:
-        lines.append("| None | - | 0 | 0 | 0 | 0 | 0 | - |")
-
-    lines.append("")
     return "\n".join(lines)
 
-def write_report(output_dir, report):
-    month_folder = report["end_date"].strftime("%Y-%m")
-    start_label = report["start_date"].isoformat()
-    end_label = report["end_date"].isoformat()
-    username = report["engineer"]["username"]
-    report_path = output_dir / report["window"] / month_folder / f"{username}_{start_label}_to_{end_label}.md"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(render_report(report), encoding="utf-8")
-    return report_path
 
-
-def write_summary_readme(output_dir, window, start_date, end_date_exclusive, engineer_reports):
+def write_summary_readme(output_dir, window, start_date, end_date_exclusive, engineer_metrics):
     end_date = end_date_exclusive - dt.timedelta(days=1)
     month_folder = end_date.strftime("%Y-%m")
     start_label = start_date.isoformat()
@@ -424,30 +431,58 @@ def write_summary_readme(output_dir, window, start_date, end_date_exclusive, eng
     summary_dir = output_dir / "summary" / window / month_folder
     summary_dir.mkdir(parents=True, exist_ok=True)
     summary_path = summary_dir / f"README_{start_label}_to_{end_label}.md"
-    summary_path.write_text(
-        render_summary_readme(window, start_date, end_date, engineer_reports, summary_dir),
-        encoding="utf-8",
-    )
+    summary_path.write_text(render_summary_markdown(window, start_date, end_date_exclusive, engineer_metrics), encoding="utf-8")
     return summary_path
+
+
+def write_github_step_summary(markdown):
+    summary_file = os.getenv("GITHUB_STEP_SUMMARY")
+    if not summary_file:
+        return
+
+    summary_path = Path(summary_file)
+    summary_path.write_text(markdown, encoding="utf-8")
+
+def get_github_display_name(session, username):
+    user = request_json(session, "GET", f"/users/{username}")
+    return user.get("name") or username
 
 
 def main():
     args = parse_args() # Parse command-line arguments provided by the user
     reference_date = parse_reference_date(args.as_of)  # Convert the --as-of argument into a usable date object
     repositories, engineers = load_config(args.config) # Load repository and engineer configuration data from the config file
-    token = load_token() # Load the GitHub API token from environment or config
-    session = github_session(token)  # Create and return an authenticated GitHub session
+    fallback_token = load_fallback_token() # Load fallback GitHub token from environment
 
     start_date, end_date = resolve_window(args.window, reference_date)
-    engineer_reports = []
+    engineer_metrics = []
+    session_cache = {}
 
     for engineer in engineers:
-        report = collect_engineer_report(session, engineer, repositories, args.window, start_date, end_date)
-        report_path = write_report(args.output_dir, report)
-        engineer_reports.append({"report": report, "path": report_path})
-        print(report_path)
+        token = resolve_engineer_token(engineer, fallback_token)
+        if not token:
+            engineer_metrics.append(build_disconnected_metrics(engineer, repositories, "missing_token"))
+            continue
 
-    print(write_summary_readme(args.output_dir, args.window, start_date, end_date, engineer_reports))
+        if token not in session_cache:
+            session_cache[token] = github_session(token)
+
+        session = session_cache[token]
+        repo_scope = engineer["repositories"] or repositories
+
+        try:
+            validate_engineer_connection(session, engineer, repo_scope)
+            metrics = collect_engineer_activity_metrics(session, engineer, repositories, start_date, end_date)
+            engineer_metrics.append(metrics)
+        except GitHubApiError as error:
+            print(f"Warning for {engineer['username']}: {error}")
+            engineer_metrics.append(build_disconnected_metrics(engineer, repositories, "connection_error"))
+
+    summary_markdown = render_summary_markdown(args.window, start_date, end_date, engineer_metrics)
+    summary_path = write_summary_readme(args.output_dir, args.window, start_date, end_date, engineer_metrics)
+    write_github_step_summary(summary_markdown)
+    print(summary_path)
+    
 
 
 if __name__ == "__main__":

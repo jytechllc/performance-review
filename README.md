@@ -1,6 +1,6 @@
 # Performance Review Metrics
 
-This repo collects GitHub activity and turns it into simple Markdown reports for performance reviews.
+This repo collects GitHub activity metrics and turns them into a simple Markdown table for performance reviews.
 
 You can run it on your computer, or you can let GitHub Actions run it on a schedule.
 
@@ -25,39 +25,29 @@ Here is the simple layout:
 
 ## Report name and location
 
-Every report is saved under `reports/`.
-
-Engineer report files use this pattern:
-
-`reports/<window>/<YYYY-MM>/<username>_<start>_to_<end>.md`
-
-Example:
-
-`reports/weekly/2026-05/octocat_2026-05-11_to_2026-05-17.md`
-
-What each part means:
-
-- `<window>` is the time range. Use `daily`, `weekly`, or `monthly`.
-- `<YYYY-MM>` is the month folder for the report end date.
-- `<username>` is the GitHub username made safe for file names.
-- `<start>` and `<end>` are the dates covered by the report.
-
-In addition to individual files, the collector also writes one team-level summary README per run:
+The collector writes one team-level summary README per run:
 
 `reports/summary/<window>/<YYYY-MM>/README_<start>_to_<end>.md`
 
-This gives you one file with everyone's totals and links to each person's report.
+This gives you one file with a single table of PR metrics for all configured engineers.
 
-## GitHub token
+When running in GitHub Actions, the same table is also shown in the workflow run summary (Actions UI).
 
-The script needs a GitHub token so it can call the GitHub API.
+## GitHub token and engineer connection
 
-It checks these environment variables in this order:
+The script supports PAT-based connection in two ways:
+
+- Per-engineer token via `token_env` in `config/engineers.yaml`
+- Fallback token via environment variable
+
+Fallback environment variables are checked in this order:
 
 1. `PERFORMANCE_REVIEW_GITHUB_TOKEN`
 2. `GITHUB_TOKEN`
 
-For GitHub Actions, store the token as a repository secret named `PERFORMANCE_REVIEW_GITHUB_TOKEN`.
+For GitHub Actions, you can store one shared token as repository secret `PERFORMANCE_REVIEW_GITHUB_TOKEN`.
+
+If you want per-engineer connection, add separate secrets and map each engineer to a secret name using `token_env`.
 
 For local use, set the same environment variable in your shell.
 
@@ -77,6 +67,7 @@ repositories:
 engineers:
   - username: octocat
     display_name: Octo Cat
+    token_env: OCTOCAT_GITHUB_TOKEN
   - username: hubot
     display_name: Hubot
 ```
@@ -85,8 +76,10 @@ How it works:
 
 - Put the GitHub usernames under `engineers`.
 - Use `display_name` if you want a nicer name in the report.
+- Use `token_env` to map one engineer to one PAT secret/environment variable.
 - Add `repositories` under one engineer if you want to track only certain repos for that person.
 - If an engineer does not have a repo list, the script uses the top-level `repositories` list.
+- If an engineer does not have `token_env`, the script uses the fallback token.
 
 ## How to run it locally
 
@@ -128,14 +121,15 @@ When it runs, it:
 - runs the collector script
 - writes new or updated report files back into the repo
 
-## What the collector measures
+## What the collector measures (MVP)
 
-The first version collects:
+The MVP automatically tracks:
 
 - commit count
 - merged pull request count
+- closed issue count
 - additions from merged pull requests
 - deletions from merged pull requests
 - files changed in merged pull requests
 
-That gives you a simple starting point, and you can add more metrics later if you want.
+Output format is intentionally simple: one Markdown table grouped by engineer, including connection status and a team-total row.
